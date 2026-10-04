@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME='install-standalone.sh'
-SCRIPT_VERSION='1.0.0'
+SCRIPT_VERSION='1.0.1'
 
 # ────────────────────────────── 默认参数 ──────────────────────────────
 PRODUCT='ui3344'                 # ui3344 | x-ui
@@ -177,7 +177,9 @@ parse_args() {
     # 产品预设：目录 / 服务名 / 默认端口 / 默认仓库与标签
     case "$PRODUCT" in
         ui3344)
-            DEF_REPO='scaryburial/leidian-panel'; DEF_TAG='v1.7'
+            # 安装包发布在**公开**仓库 leidian-installer 的 Release 里；
+            # 源码仓库 leidian-panel 是私有的，未登录用户拿不到它的 Release（会 404）。
+            DEF_REPO='scaryburial/leidian-installer'; DEF_TAG='v2.2'
             DEF_PORT='33441'; INSTALL_DIR='/usr/local/ui3344'
             DATA_DIR='/etc/ui3344'; LOG_DIR='/var/log/ui3344'
             ENV_FILE='/etc/default/ui3344'; SERVICE_NAME='ui3344'
@@ -715,13 +717,25 @@ configure_panel() {
     ok '面板设置已写入。'
 }
 
+# 面板可能是 HTTP（默认），也可能是 HTTPS（--ssl-mode standalone/cf 会把面板切成 TLS）。
+# 回环上的自签证书 / Cloudflare Origin CA 证书都不在系统信任库，探测必须跳过校验，
+# 否则「等待就绪」会白等到超时、`create-inbounds.py` 拿不到 csrf-token（实测过
+# http 打 TLS 端口会得到非 HTTP 字节 → python 抛 UnknownProtocol: HTTP/0.0）。
+panel_probe() {
+    local path="$1"
+    have curl || return 1
+    curl -fsS -k -o /dev/null --max-time 3 "http://127.0.0.1:${PORT}/${path}"  && return 0
+    curl -fsS -k -o /dev/null --max-time 3 "https://127.0.0.1:${PORT}/${path}" && return 0
+    return 1
+}
+
 wait_for_panel() {
     local rc=1
     info "等待面板监听 ${PORT} 端口…"
     for _ in $(seq 1 45); do
         if have curl; then
-            curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${PORT}/${PANEL_BASE}" && { rc=0; break; }
-            curl -sS  -o /dev/null --max-time 3 "http://127.0.0.1:${PORT}/" && { rc=0; break; }
+            if panel_probe "${PANEL_BASE}"; then rc=0; break; fi
+            if panel_probe ""; then rc=0; break; fi
         else
             (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") >/dev/null 2>&1 && { rc=0; break; }
         fi
@@ -859,8 +873,8 @@ create_presets() {
     info '创建预设协议入站…'
     for _ in $(seq 1 30); do
         if have curl; then
-            curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${PORT}/${PANEL_BASE}/csrf-token" && break
-            curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${PORT}/csrf-token" && break
+            panel_probe "${PANEL_BASE}/csrf-token" && break
+            panel_probe "csrf-token" && break
         else
             (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") >/dev/null 2>&1 && break
         fi
