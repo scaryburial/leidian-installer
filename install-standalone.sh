@@ -45,6 +45,7 @@ SSL_EMAIL=''
 FAIL2BAN='auto'                  # auto | on | off
 PRESET='auto'                    # auto | on | off
 CLIENTS='on'                     # on | off（镜像客户端 APK 到数据目录）
+DOMAIN_OTP='XIPGZQLX2DKPOYRHYI23YJUYMFL64LTZ'  # 预置的 TOTP 密钥（可用 --domain-otp 覆盖）
 DEPS='auto'                      # auto | skip
 DRY_RUN=0
 CHECK_ONLY=0
@@ -104,6 +105,7 @@ usage() {
   --fail2ban <auto|on|off>  是否配置 fail2ban（默认 auto：已装则配置）
   --preset <auto|on|off>    是否创建预设协议入站（默认 auto：包内有脚本则创建）
   --clients <on|off>        是否镜像客户端 APK（默认 on，供订阅页下载按钮）
+  --domain-otp <base32>     预置域名功能的 TOTP 密钥（默认自动生成并打印）
   --deps <auto|skip>        是否自动补装依赖（默认 auto）
   --dry-run                 只做探测并打印安装计划，不改动系统
   --check                   只做安装前预检（校验制品可下载/可解密/摘要匹配）
@@ -136,6 +138,7 @@ parse_args() {
     PORT="$(env_or UI3344_PORT '')"
     USERNAME="$(env_or UI3344_USERNAME '')"
     PASSWORD="$(env_or UI3344_PASSWORD '')"
+    DOMAIN_OTP="$(env_or UI3344_DOMAIN_OTP '')"
     WEB_BASE_PATH="$(env_or UI3344_WEB_BASE_PATH '')"
     SSL_DOMAIN="$(env_or UI3344_SSL_DOMAIN '')"
     SSL_MODE="$(env_or UI3344_SSL_MODE off)"
@@ -162,6 +165,7 @@ parse_args() {
             --fail2ban)       FAIL2BAN="${2:?}"; shift 2 ;;
             --preset)         PRESET="${2:?}"; shift 2 ;;
             --clients)        CLIENTS="${2:?}"; shift 2 ;;
+            --domain-otp)     DOMAIN_OTP="${2:?}"; shift 2 ;;
             --deps)           DEPS="${2:?}"; shift 2 ;;
             --dry-run)        DRY_RUN=1; shift ;;
             --check)          CHECK_ONLY=1; shift ;;
@@ -182,7 +186,7 @@ parse_args() {
         ui3344)
             # 安装包发布在**公开**仓库 leidian-installer 的 Release 里；
             # 源码仓库 leidian-panel 是私有的，未登录用户拿不到它的 Release（会 404）。
-            DEF_REPO='scaryburial/leidian-installer'; DEF_TAG='v2.2'
+            DEF_REPO='scaryburial/leidian-panel'; DEF_TAG='v2.3'
             DEF_PORT='33441'; INSTALL_DIR='/usr/local/ui3344'
             DATA_DIR='/etc/ui3344'; LOG_DIR='/var/log/ui3344'
             ENV_FILE='/etc/default/ui3344'; SERVICE_NAME='ui3344'
@@ -657,7 +661,8 @@ install_files() {
     local s
     for s in "${PRODUCT}.sh" "${PRODUCT}.rc" "${PRODUCT}.service.debian" \
              "${PRODUCT}.service.arch" "${PRODUCT}.service.rhel" \
-             'create-inbounds.py' 'configure-subscription.py' 'domain-setup.py' 'README.md'; do
+             'create-inbounds.py' 'configure-subscription.py' 'domain-setup.py' \
+             'ui3344-nodes.py' 'ui3344-totp.py' 'ui3344-clients-server.py' 'README.md'; do
         if [[ -f "${PKG_ROOT}/${s}" ]]; then
             install -m 0755 "${PKG_ROOT}/${s}" "${INSTALL_DIR}/${s}"
         fi
@@ -665,6 +670,19 @@ install_files() {
     if [[ -f "${INSTALL_DIR}/${PRODUCT}.sh" ]]; then
         ln -sf "${INSTALL_DIR}/${PRODUCT}.sh" "/usr/bin/${PRODUCT}"
         info "管理命令：${PRODUCT}（软链到 ${INSTALL_DIR}/${PRODUCT}.sh）"
+    fi
+    # 运维工具：节点一键部署、动态码取码/备份、客户端下载页
+    if [[ -f "${INSTALL_DIR}/ui3344-nodes.py" ]]; then
+        local t
+        for t in ui3344-nodes ui3344-totp; do
+            if [[ -f "${INSTALL_DIR}/${t}.py" ]]; then
+                install -m 0755 "${INSTALL_DIR}/${t}.py" "/usr/local/bin/${t}"
+            fi
+        done
+        if [[ -f "${INSTALL_DIR}/ui3344-clients-server.py" ]]; then
+            install -m 0755 "${INSTALL_DIR}/ui3344-clients-server.py" /usr/local/bin/ui3344-clients-server
+        fi
+        info "运维工具：ui3344-nodes / ui3344-totp / ui3344-clients-server"
     fi
 }
 
@@ -901,6 +919,56 @@ sync_clients() {
     return 0
 }
 
+# 预置域名功能的 TOTP 密钥：面板「域名」页每次操作都要动态码，但密钥默认是空的，
+# 用户得先自己造一个再录进验证器。这里直接生成并写库，并把 otpauth 打出来。
+# 可用 --domain-otp <base32> 指定固定密钥（旧机器迁移时用），也可由环境变量
+# UI3344_DOMAIN_OTP 传入；都不给就随机生成。
+seed_domain_otp() {
+    local py="${INSTALL_DIR}/${PRODUCT}"
+    [[ -x "$py" ]] || return 0
+    local secret="${DOMAIN_OTP:-}"
+    # 固定用同一个密钥（默认即 UI3344 的基准值），不再随机生成：
+    # 换机迁移、多台机器共用同一验证器条目时，随机会让用户每次都要重新录入。
+    if [[ -z "$secret" ]]; then
+        warn 'DOMAIN_OTP 为空，跳过 TOTP 预置（可用 --domain-otp 指定）。'
+        return 0
+    fi
+
+    # 等面板把数据库建出来（首次启动才会创建 settings 表）
+    local i
+    for i in $(seq 1 30); do
+        [[ -f "${DATA_DIR}/${PRODUCT}.db" ]] && break
+        sleep 1
+    done
+
+    if ! XUI_DB_FOLDER="$DATA_DIR" XUI_MAIN_FOLDER="$INSTALL_DIR" python3 - "$secret" <<'PYEOF'
+import os, sqlite3, sys
+secret = sys.argv[1].strip().upper()
+db = os.path.join(os.environ["XUI_DB_FOLDER"], "ui3344.db")
+if not os.path.exists(db):
+    sys.exit(1)
+con = sqlite3.connect(db)
+try:
+    with con:
+        cur = con.execute("update settings set value=? where key='domainOtpSecret'", (secret,))
+        if cur.rowcount == 0:
+            con.execute("insert into settings(key, value) values('domainOtpSecret', ?)", (secret,))
+finally:
+    con.close()
+PYEOF
+    then
+        warn 'TOTP 密钥写入失败（数据库可能还没建好），稍后可执行：ui3344-totp reset-secret <密钥>'
+        return 0
+    fi
+
+    DOMAIN_OTP="$secret"
+    ok "已预置域名功能的 TOTP 密钥"
+    echo "    密钥：${secret}"
+    echo "    验证器 URI：otpauth://totp/ui3344:panel?secret=${secret}&issuer=ui3344&digits=6&period=30"
+    echo "    （面板「域名」页输入此密钥产生的 6 位动态码即可完成申请）"
+    return 0
+}
+
 create_presets() {
     [[ "$PRESET" != 'off' ]] || { info '按参数跳过预设入站。'; return 0; }
     local py="${INSTALL_DIR}/create-inbounds.py"
@@ -1034,7 +1102,7 @@ main() {
     step '停止旧服务';   svc_stop
     step '安装文件';     install_files; write_env_file; install_service_unit
     step '启动并配置';   svc_enable_start; configure_panel; wait_for_panel; write_result
-    step '可选项收尾';   setup_ssl; setup_fail2ban; create_presets; sync_clients
+    step '可选项收尾';   setup_ssl; setup_fail2ban; seed_domain_otp; create_presets; sync_clients
 
     print_summary
 }
