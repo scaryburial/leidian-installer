@@ -44,6 +44,7 @@ SSL_MODE='off'                   # off | standalone | cf
 SSL_EMAIL=''
 FAIL2BAN='auto'                  # auto | on | off
 PRESET='auto'                    # auto | on | off
+CLIENTS='on'                     # on | off（镜像客户端 APK 到数据目录）
 DEPS='auto'                      # auto | skip
 DRY_RUN=0
 CHECK_ONLY=0
@@ -102,6 +103,7 @@ usage() {
   --ssl-email <mail>        ACME 注册邮箱（可选）
   --fail2ban <auto|on|off>  是否配置 fail2ban（默认 auto：已装则配置）
   --preset <auto|on|off>    是否创建预设协议入站（默认 auto：包内有脚本则创建）
+  --clients <on|off>        是否镜像客户端 APK（默认 on，供订阅页下载按钮）
   --deps <auto|skip>        是否自动补装依赖（默认 auto）
   --dry-run                 只做探测并打印安装计划，不改动系统
   --check                   只做安装前预检（校验制品可下载/可解密/摘要匹配）
@@ -159,6 +161,7 @@ parse_args() {
             --ssl-email)      SSL_EMAIL="${2:?}"; shift 2 ;;
             --fail2ban)       FAIL2BAN="${2:?}"; shift 2 ;;
             --preset)         PRESET="${2:?}"; shift 2 ;;
+            --clients)        CLIENTS="${2:?}"; shift 2 ;;
             --deps)           DEPS="${2:?}"; shift 2 ;;
             --dry-run)        DRY_RUN=1; shift ;;
             --check)          CHECK_ONLY=1; shift ;;
@@ -204,6 +207,7 @@ parse_args() {
     case "$SSL_MODE" in off|standalone|cf) ;; *) die "--ssl-mode 只支持 off/standalone/cf" ;; esac
     case "$FAIL2BAN" in auto|on|off) ;; *) die "--fail2ban 只支持 auto/on/off" ;; esac
     case "$PRESET"   in auto|on|off) ;; *) die "--preset 只支持 auto/on/off" ;; esac
+    case "$CLIENTS"  in on|off)      ;; *) die "--clients 只支持 on/off" ;; esac
     case "$DEPS"     in auto|skip)   ;; *) die "--deps 只支持 auto/skip" ;; esac
     if [[ -n "$SSL_DOMAIN" && "$SSL_MODE" == 'off' ]]; then
         SSL_MODE='standalone'
@@ -859,6 +863,44 @@ setup_fail2ban() {
     return 0
 }
 
+# 下载客户端安装包（可关：--clients off）。把订阅页「客户端下载」按钮指向的 APK
+# 先镜像到本机，网络受限的用户就不必去 GitHub / 应用商店。
+# 只镜像「官方以 GitHub Release / F-Droid 分发」的开源客户端；闭源的
+# （V2Box / V2RayTun / NPV Tunnel）只在页面上给商店链接，不在本机转载。
+CLIENT_FILES=(
+  "v2rayng-universal.apk|https://github.com/2dust/v2rayNG/releases/download/2.3.15/v2rayNG_2.3.15_universal.apk"
+  "v2rayng-arm64.apk|https://github.com/2dust/v2rayNG/releases/download/2.3.15/v2rayNG_2.3.15_arm64-v8a.apk"
+  "singbox-sfa.apk|https://f-droid.org/repo/io.nekohasekai.sfa_746.apk"
+  "happ.apk|https://github.com/Happ-proxy/happ-android/releases/download/4.10.1/Happ.apk"
+  "incy.apk|https://github.com/INCY-DEV/incy-platforms/releases/download/android-v3.9.9/Incy.apk"
+)
+
+sync_clients() {
+    [[ "${CLIENTS}" == 'on' ]] || { info '按参数跳过客户端镜像。'; return 0; }
+    have curl || { warn '缺少 curl，跳过客户端镜像。'; return 0; }
+    local dir="${DATA_DIR}/clients"
+    mkdir -p "$dir"
+    local item name url
+    for item in "${CLIENT_FILES[@]}"; do
+        name="${item%%|*}"; url="${item#*|}"
+        if [[ -s "${dir}/${name}" ]]; then
+            info "已存在：${name}"
+            continue
+        fi
+        info "镜像客户端：${name}"
+        if curl -fL --retry 2 --connect-timeout 20 --max-time 1800 \
+                -o "${dir}/${name}.part" "$url"; then
+            mv -f "${dir}/${name}.part" "${dir}/${name}"
+        else
+            rm -f "${dir}/${name}.part"
+            warn "下载失败，跳过：${name}"
+        fi
+    done
+    chmod 0644 "$dir"/*.apk 2>/dev/null || true
+    ok "客户端镜像目录：${dir}"
+    return 0
+}
+
 create_presets() {
     [[ "$PRESET" != 'off' ]] || { info '按参数跳过预设入站。'; return 0; }
     local py="${INSTALL_DIR}/create-inbounds.py"
@@ -880,10 +922,22 @@ create_presets() {
         fi
         sleep 1
     done
-    if python3 "$py"; then
+    # 口令是本脚本自己（随机）生成的，create-inbounds.py 读不到——面板新版把口令
+    # 存进 users 表，`setting -show` 不再打印。不显式传进去，全新安装就会
+    # 「装完一个协议都没有」，日志里只留一句认证失败。
+    # 面板地址同理：安全入口与端口都可能是随机的，必须把探测到的基址一并给它，
+    # 否则 create-inbounds.py 会拿写死的 /ui3344 去敲，永远敲不到。
+    local pb="$PANEL_BASE"
+    case "$pb" in */) ;; *) pb="$pb/" ;; esac
+    local url="http://127.0.0.1:${PORT}/${pb}"
+    if curl -kfsS --max-time 3 "https://127.0.0.1:${PORT}/${pb}csrf-token" >/dev/null 2>&1; then
+        url="https://127.0.0.1:${PORT}/${pb}"
+    fi
+    if UI3344_URL="$url" UI3344_USER="$PANEL_USER" UI3344_PASS="$PANEL_PASS" python3 "$py"; then
         ok '预设入站已创建。'
     else
         warn '预设入站创建失败（可稍后手动运行 create-inbounds.py）。'
+        warn "  补跑：UI3344_PASS='${PANEL_PASS}' python3 ${py}"
     fi
     return 0
 }
@@ -980,7 +1034,7 @@ main() {
     step '停止旧服务';   svc_stop
     step '安装文件';     install_files; write_env_file; install_service_unit
     step '启动并配置';   svc_enable_start; configure_panel; wait_for_panel; write_result
-    step '可选项收尾';   setup_ssl; setup_fail2ban; create_presets
+    step '可选项收尾';   setup_ssl; setup_fail2ban; create_presets; sync_clients
 
     print_summary
 }
