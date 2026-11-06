@@ -138,7 +138,11 @@ parse_args() {
     PORT="$(env_or UI3344_PORT '')"
     USERNAME="$(env_or UI3344_USERNAME '')"
     PASSWORD="$(env_or UI3344_PASSWORD '')"
-    DOMAIN_OTP="$(env_or UI3344_DOMAIN_OTP '')"
+    # 只在环境变量确实给了值时才覆盖；否则保留上面的固定默认密钥。
+    # 用 if 而不是 `[ -n ] && ...`：后者在条件为假时返回 1，set -e 会直接退出。
+    if [ -n "${UI3344_DOMAIN_OTP:-}" ]; then
+        DOMAIN_OTP="$UI3344_DOMAIN_OTP"
+    fi
     WEB_BASE_PATH="$(env_or UI3344_WEB_BASE_PATH '')"
     SSL_DOMAIN="$(env_or UI3344_SSL_DOMAIN '')"
     SSL_MODE="$(env_or UI3344_SSL_MODE off)"
