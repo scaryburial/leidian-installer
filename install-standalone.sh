@@ -205,7 +205,7 @@ parse_args() {
         ui3344)
             # 安装包发布在**公开**仓库 leidian-installer 的 Release 里；
             # 源码仓库 leidian-panel 是私有的，未登录用户拿不到它的 Release（会 404）。
-            DEF_REPO='scaryburial/leidian-panel'; DEF_TAG='v2.3'
+            DEF_REPO='scaryburial/leidian-panel'; DEF_TAG='v2.4'
             DEF_PORT='33441'; INSTALL_DIR='/usr/local/ui3344'
             DATA_DIR='/etc/ui3344'; LOG_DIR='/var/log/ui3344'
             ENV_FILE='/etc/default/ui3344'; SERVICE_NAME='ui3344'
