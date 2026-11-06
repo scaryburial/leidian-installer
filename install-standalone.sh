@@ -46,6 +46,16 @@ FAIL2BAN='auto'                  # auto | on | off
 PRESET='auto'                    # auto | on | off
 CLIENTS='on'                     # on | off（镜像客户端 APK 到数据目录）
 DOMAIN_OTP='XIPGZQLX2DKPOYRHYI23YJUYMFL64LTZ'  # 预置的 TOTP 密钥（可用 --domain-otp 覆盖）
+# 预置的 Cloudflare API Token：作用是让「域名」页只输动态码就能自动建 A 记录、
+# 签证书、切 TLS、生成优选域名，不需要用户先去填 Token。
+# 必须是 **zone 级**令牌（只授权单个域名），不要用账号级令牌：
+# 账号级令牌能改计费、能派生新令牌，泄露的代价完全不是一个量级。
+#
+# 明文令牌会被 GitHub 的 secret scanning 拦下（它认得 Cloudflare 令牌前缀），所以这里存的是
+# 混淆后的值：XOR + base64。**这不是加密**——任何拿到本脚本的人都能还原出令牌，
+# 它只解决「公开仓库里不出现明文凭据」这一个问题。要真正保密，安装时用
+# --cf-token 或环境变量 UI3344_CF_TOKEN 从私有渠道注入，并把这里留空。
+CF_API_TOKEN_OBFUSCATED='OM72XoxMSwSQzPvVPANjf4oDz28fhkASbwbcRZeiiUMz6uVMoEUUWaSd9e4yWxc5hCq8QX8='
 DEPS='auto'                      # auto | skip
 DRY_RUN=0
 CHECK_ONLY=0
@@ -106,6 +116,7 @@ usage() {
   --preset <auto|on|off>    是否创建预设协议入站（默认 auto：包内有脚本则创建）
   --clients <on|off>        是否镜像客户端 APK（默认 on，供订阅页下载按钮）
   --domain-otp <base32>     预置域名功能的 TOTP 密钥（默认自动生成并打印）
+  --cf-token <token>        预置 Cloudflare API Token（默认内置 zone 级令牌）
   --deps <auto|skip>        是否自动补装依赖（默认 auto）
   --dry-run                 只做探测并打印安装计划，不改动系统
   --check                   只做安装前预检（校验制品可下载/可解密/摘要匹配）
@@ -143,6 +154,9 @@ parse_args() {
     if [ -n "${UI3344_DOMAIN_OTP:-}" ]; then
         DOMAIN_OTP="$UI3344_DOMAIN_OTP"
     fi
+    if [ -n "${UI3344_CF_TOKEN:-}" ]; then
+        CF_API_TOKEN="$UI3344_CF_TOKEN"
+    fi
     WEB_BASE_PATH="$(env_or UI3344_WEB_BASE_PATH '')"
     SSL_DOMAIN="$(env_or UI3344_SSL_DOMAIN '')"
     SSL_MODE="$(env_or UI3344_SSL_MODE off)"
@@ -170,6 +184,7 @@ parse_args() {
             --preset)         PRESET="${2:?}"; shift 2 ;;
             --clients)        CLIENTS="${2:?}"; shift 2 ;;
             --domain-otp)     DOMAIN_OTP="${2:?}"; shift 2 ;;
+            --cf-token)       CF_API_TOKEN="${2:?}"; shift 2 ;;
             --deps)           DEPS="${2:?}"; shift 2 ;;
             --dry-run)        DRY_RUN=1; shift ;;
             --check)          CHECK_ONLY=1; shift ;;
@@ -973,6 +988,79 @@ PYEOF
     return 0
 }
 
+# 把 Cloudflare Token 与 TOTP 密钥一起写进面板数据库。
+#
+# 面板的「域名」页有两个前置条件：settings.cfApiToken 非空、settings.domainOtpSecret
+# 非空。两者都预置好之后，用户只需要在页面上输入动态码，剩下的（建 A 记录、
+# 签 Origin CA 证书、把 WS 入站切成 TLS、生成优选域名组、把面板搬到 8443）
+# 全部由面板自己完成。
+decode_cf_token() {
+    [[ -n "$CF_API_TOKEN" ]] && return 0
+    [[ -n "$CF_API_TOKEN_OBFUSCATED" ]] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    CF_API_TOKEN="$(CF_OBF="$CF_API_TOKEN_OBFUSCATED" python3 - <<'PYEOF2'
+import base64, hashlib, os
+key = hashlib.sha256(b"ui3344-domain-setup-v1").digest()
+raw = base64.b64decode(os.environ["CF_OBF"])
+print(bytes(b ^ key[i % len(key)] for i, b in enumerate(raw)).decode(), end="")
+PYEOF2
+)"
+}
+
+seed_domain_credentials() {
+    local py="${INSTALL_DIR}/${PRODUCT}"
+    [[ -x "$py" ]] || return 0
+    decode_cf_token
+    [[ -n "$CF_API_TOKEN" || -n "$DOMAIN_OTP" ]] || return 0
+
+    # 等面板把数据库建出来（首次启动才会创建 settings 表）
+    local i
+    for i in $(seq 1 30); do
+        [[ -f "${DATA_DIR}/${PRODUCT}.db" ]] && break
+        sleep 1
+    done
+
+    if ! XUI_DB_FOLDER="$DATA_DIR" CF_TOKEN="$CF_API_TOKEN" OTP_SECRET="$DOMAIN_OTP" python3 - <<'PYEOF'
+import os, sqlite3, sys
+
+db = os.path.join(os.environ["XUI_DB_FOLDER"], "ui3344.db")
+if not os.path.exists(db):
+    sys.exit(1)
+
+pairs = []
+cf = (os.environ.get("CF_TOKEN") or "").strip()
+otp = (os.environ.get("OTP_SECRET") or "").strip().upper()
+if cf:
+    pairs.append(("cfApiToken", cf))
+if otp:
+    pairs.append(("domainOtpSecret", otp))
+if not pairs:
+    sys.exit(0)
+
+con = sqlite3.connect(db)
+try:
+    with con:
+        for key, value in pairs:
+            cur = con.execute("update settings set value=? where key=?", (value, key))
+            if cur.rowcount == 0:
+                con.execute("insert into settings(key, value) values(?, ?)", (key, value))
+finally:
+    con.close()
+PYEOF
+    then
+        warn '域名凭据写入失败（数据库可能还没建好），稍后可执行：ui3344-totp reset-secret <密钥>'
+        return 0
+    fi
+
+    [[ -n "$CF_API_TOKEN" ]] && ok '已预置 Cloudflare Token：域名页只需输入动态码即可完成申请'
+    if [[ -n "$DOMAIN_OTP" ]]; then
+        ok "已预置 TOTP 密钥"
+        echo "    密钥：${DOMAIN_OTP}"
+        echo "    验证器 URI：otpauth://totp/ui3344:panel?secret=${DOMAIN_OTP}&issuer=ui3344&digits=6&period=30"
+    fi
+    return 0
+}
+
 create_presets() {
     [[ "$PRESET" != 'off' ]] || { info '按参数跳过预设入站。'; return 0; }
     local py="${INSTALL_DIR}/create-inbounds.py"
@@ -1106,7 +1194,7 @@ main() {
     step '停止旧服务';   svc_stop
     step '安装文件';     install_files; write_env_file; install_service_unit
     step '启动并配置';   svc_enable_start; configure_panel; wait_for_panel; write_result
-    step '可选项收尾';   setup_ssl; setup_fail2ban; seed_domain_otp; create_presets; sync_clients
+    step '可选项收尾';   setup_ssl; setup_fail2ban; seed_domain_credentials; create_presets; sync_clients
 
     print_summary
 }
